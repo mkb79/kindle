@@ -1,12 +1,13 @@
 # found api endpoints
-# have to find out more
+# there are many more but what they do?
 
-
+import base64
 import json
 from datetime import datetime
 
 import httpx
 import xmltodict
+from amazon.ion import simpleion
 
 
 def get_library(auth):
@@ -27,6 +28,12 @@ def _build_correlation_id(auth, asin):
     return f"Device:{device}:{serial};kindle.EBOK:{asin}:{timestamp}"
 
 
+def _b64ion_to_dict(b64ion: str):
+    ion = base64.b64decode(b64ion)
+    ion = simpleion.loads(ion)
+    return dict(ion)
+
+
 def get_manifest(auth, asin: str):
     asin = asin.upper()
     url = f"https://kindle-digital-delivery.amazon.com/delivery/manifest/kindle.ebook/{asin}"
@@ -42,7 +49,13 @@ def get_manifest(auth, asin: str):
     }
     with httpx.Client(auth=auth) as session:
         r = session.get(url, headers=headers)
-        return r.json()
+        manifest = r.json()
+
+    manifest["responseContext"] = _b64ion_to_dict(manifest["responseContext"])
+    for resource in manifest["resources"]:
+        if resource.get("responseContext"):
+            resource["responseContext"] = _b64ion_to_dict(resource["responseContext"])
+    return manifest
 
 
 def whispersync(auth):

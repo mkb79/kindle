@@ -51,7 +51,8 @@ setup(
         'Pillow',
         'pyaes',
         'rsa',
-        'xmltodict'
+        'xmltodict',
+        'amazon.ion'
     ],
     extras_require={
         'docs': [
