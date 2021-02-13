@@ -7,6 +7,7 @@ import pathlib
 import re
 from datetime import datetime
 from typing import Dict, Optional, Union
+from zipfile import ZipFile
 
 import httpx
 import xmltodict
@@ -36,10 +37,10 @@ def get_library(auth: "kindle.Authenticator",
     params = {"item_count": 1000}
 
     if isinstance(last_sync, dict):
-        if "sync_time" in last_sync:
+        try:
             last_sync = last_sync["sync_time"]
-        else:
-            raise ValueError("`last_sync` doesn't contain a `sync_time`.")
+        except KeyError as exc:
+            raise ValueError("`last_sync` doesn't contain `sync_time`.") from exc
 
     if last_sync is not None:
         params["last_sync_time"] = last_sync
@@ -82,6 +83,7 @@ def get_manifest_ebook(auth: "kindle.Authenticator", asin: str) -> Dict:
         "x-amzn-accept-type": "application/x.amzn.digital.deliverymanifest@1.0",
         "X-ADP-SW": "1184366692"
     }
+
     with httpx.Client(auth=auth) as session:
         r = session.get(url, headers=headers)
         manifest = r.json()
@@ -96,67 +98,73 @@ def get_manifest_ebook(auth: "kindle.Authenticator", asin: str) -> Dict:
 def download_ebook(auth: "kindle.Authenticator", manifest: Dict, make_zip=True):
     """proof-of-concent, quick and dirty, donwload content and saving them in current working dir."""
     session = httpx.Client(auth=auth)
+    files = []
     for resource in manifest["resources"]:
         delivery = resource.get("deliveryType")
         requirement = resource.get("requirement")
-        type = resource.get("type")
+        type_ = resource.get("type")
         size = resource.get("size")
-        endpoint = resource.get("optimalEndpoint", resource["endpoint"])
-        
+        endpoint = resource.get("optimalEndpoint", resource.get("endpoint"))
+        id_ = resource["id"]
+
+        print(f"TYPE:        {type_}")
         print(f"DELIVERY:    {delivery}")
         print(f"ENDPOINT:    {endpoint}")
         print(f"REQUIREMENT: {requirement}")
-        print(f"TYPE:        {type}")
+        print(f"ID:          {id_}")
         print(f"SIZE:        {size}")
-    
-        url = None
-        if "directUrl" in endpoint:
-            url = endpoint["directUrl"]
-        elif "url" in endpoint:
-            url = endpoint["url"]
+
+        url = endpoint.get("directUrl", endpoint.get("url"))
+        assert url is not None, "Error getting url for part."
+
+        headers = {}
+        if type_ == "DRM_VOUCHER":
+            timestamp = manifest["responseContext"]["manifestTime"]
+            asin = manifest["content"]["id"]
+            correlation_id = _build_correlation_id(auth, asin, timestamp)
+            headers = {
+                "User-Agent": "Kindle/1.0.235280.0.10 CFNetwork/1220.1 Darwin/20.3.0",
+                "X-ADP-AttemptCount": "1",
+                "X-ADP-CorrelationId": correlation_id,
+                "X-ADP-Transport": manifest["responseContext"]["transport"],
+                "X-ADP-Reason": manifest["responseContext"]["reason"],
+                "Accept-Language": auth.locale.language,
+                "x-amzn-accept-type": "application/x.amzn.digital.deliverymanifest@1.0",
+                "X-ADP-SW": manifest["responseContext"]["swVersion"],
+                "X-ADP-LTO": "60",
+                "Accept": "application/x-com.amazon.drm.Voucher@1.0"
+            }
+            if "country" in manifest["responseContext"]:
+                headers["X-ADP-Country"] = manifest["responseContext"]["country"]
+            url += "&supportedVoucherVersions=V1%2CV2%2CV3%2CV4%2CV5%2CV6%2CV7%2CV8%2CV9%2CV10%2CV11%2CV12%2CV13%2CV14%2CV15%2CV16%2CV17%2CV18%2CV19%2CV20%2CV21%2CV22%2CV23%2CV24%2CV25%2CV26%2CV27%2CV28%2CV9708%2CV1031%2CV2069%2CV9041%2CV3646%2CV6052%2CV9479%2CV9888%2CV4648%2CV5683"
+
+        try:
+            r = session.get(url, headers=headers)
+            r.raise_for_status()
+        except:
+            print(f"Got error code {r.status_code}. Abort downloading book part.")
+            continue
+
+        if r.headers.get("content-disposition"):
+            cd = r.headers.get("content-disposition")
+            fn = re.findall('filename="(.+)"', cd)
+            fn = fn[0]
         else:
-            print("Error in url")
-    
-        if url:
-            if type == "DRM_VOUCHER":
-                timestamp = manifest["responseContext"]["manifestTime"]
-                asin = manifest["content"]["id"]
-                correlation_id = _build_correlation_id(auth, asin, timestamp)
-                headers = {
-                    "User-Agent": "Kindle/1.0.235280.0.10 CFNetwork/1220.1 Darwin/20.3.0",
-                    "X-ADP-AttemptCount": "1",
-                    "X-ADP-CorrelationId": correlation_id,
-                    "X-ADP-Transport": manifest["responseContext"]["transport"],
-                    "X-ADP-Reason": manifest["responseContext"]["reason"],
-                    "Accept-Language": auth.locale.language,
-                    "x-amzn-accept-type": "application/x.amzn.digital.deliverymanifest@1.0",
-                    "X-ADP-SW": manifest["responseContext"]["swVersion"],
-                    "X-ADP-LTO": "60",
-                    "Accept": "application/x-com.amazon.drm.Voucher@1.0"
-                }
-                if "country" in manifest["responseContext"]:
-                    headers["X-ADP-Country"] = manifest["responseContext"]["country"]
-                print("Found DRM Voucher")
-                url += "&supportedVoucherVersions=V1%2CV2%2CV3%2CV4%2CV5%2CV6%2CV7%2CV8%2CV9%2CV10%2CV11%2CV12%2CV13%2CV14%2CV15%2CV16%2CV17%2CV18%2CV19%2CV20%2CV21%2CV22%2CV23%2CV24%2CV25%2CV26%2CV27%2CV28%2CV9708%2CV1031%2CV2069%2CV9041%2CV3646%2CV6052%2CV9479%2CV9888%2CV4648%2CV5683"
-                r = session.get(url, headers=headers)
-            else:
-                r = session.get(url)
-            try:
-                r.raise_for_status()
-                if r.headers.get("content-disposition"):
-                    cd = r.headers.get("content-disposition")
-                    fn = re.findall('filename="?(.+)"?', cd)
-                    fn = fn[0]
-                else:
-                    fn = resource["id"]
-                fn = pathlib.Path(fn)
-                fn.write_bytes(r.content)
-            except:
-                print("ERROR")
-                print(r.status_code)
-                print(r.content)
+            fn = id_
+        fn = pathlib.Path(fn)
+        files.append(fn)
+        fn.write_bytes(r.content)
+        print(f"Book part successfully downloaded and saved to {fn}.")
+
         print()
         print()
+
+    if make_zip:
+        fn = manifest["content"]["id"].upper() + "_EBOK.kfx-zip"
+        with ZipFile(fn, 'w') as myzip:
+            for file in files:
+                myzip.write(file)
+                file.unlink()
 
 
 def download_pdoc(auth: "kindle.Authenticator", asin: str) -> None:
