@@ -3,24 +3,58 @@
 
 import base64
 import json
+import pathlib
+import re
 from datetime import datetime
+from typing import Dict, Optional, Union
 
 import httpx
 import xmltodict
 from amazon.ion import simpleion
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import kindle
 
-def get_library(auth):
+
+def get_library(auth: "kindle.Authenticator",
+                last_sync: Optional[Union[str, Dict]] = None) -> Dict:
+    """Fetches the user library.
+
+    Args:
+        auth: The Kindle Authenticator
+        last_sync: If not `None`, the library will be updated instead of a 
+            full sync. The `last_sync` value have to be taken from last sync 
+            response `sync_time` key as string or provide the full sync
+            response and the function will extract the value.
+
+    Returns:
+        The user library.
+
+    """
     url = "https://todo-ta-g7g.amazon.com/FionaTodoListProxy/syncMetaData"
     params = {"item_count": 1000}
+
+    if isinstance(last_sync, dict):
+        if "sync_time" in last_sync:
+            last_sync = last_sync["sync_time"]
+        else:
+            raise ValueError("`last_sync` doesn't contain a `sync_time`.")
+
+    if last_sync is not None:
+        params["last_sync_time"] = last_sync
+
     with httpx.Client(auth=auth) as session:
         r = session.get(url, params=params)
+        r.raise_for_status()
         library = xmltodict.parse(r.text)
         library = json.loads(json.dumps(library))
         return library.get("response", library)
 
 
-def _build_correlation_id(auth, asin, timestamp=None):
+def _build_correlation_id(auth: "kindle.Authenticator",
+                          asin: str,
+                          timestamp: Optional[str] = None) -> str:
     device = auth.device_info["device_type"]
     serial = auth.device_info["device_serial_number"]
     if timestamp is None:
@@ -29,13 +63,13 @@ def _build_correlation_id(auth, asin, timestamp=None):
     return f"Device:{device}:{serial};kindle.EBOK:{asin}:{timestamp}"
 
 
-def _b64ion_to_dict(b64ion: str):
+def _b64ion_to_dict(b64ion: str) -> Dict:
     ion = base64.b64decode(b64ion)
     ion = simpleion.loads(ion)
     return dict(ion)
 
 
-def get_manifest(auth, asin: str):
+def get_manifest_ebook(auth: "kindle.Authenticator", asin: str) -> Dict:
     asin = asin.upper()
     url = f"https://kindle-digital-delivery.amazon.com/delivery/manifest/kindle.ebook/{asin}"
     headers = {
@@ -59,8 +93,8 @@ def get_manifest(auth, asin: str):
     return manifest
 
 
-def download_book(auth, manifest, make_zip=True):
-    """proof-of-concent, quick and dirty, donwload content without saving with additional info"""
+def download_ebook(auth: "kindle.Authenticator", manifest: Dict, make_zip=True):
+    """proof-of-concent, quick and dirty, donwload content and saving them in current working dir."""
     session = httpx.Client(auth=auth)
     for resource in manifest["resources"]:
         delivery = resource.get("deliveryType")
@@ -107,23 +141,39 @@ def download_book(auth, manifest, make_zip=True):
                 r = session.get(url, headers=headers)
             else:
                 r = session.get(url)
-                pass
             try:
                 r.raise_for_status()
                 if r.headers.get("content-disposition"):
-                    fn = r.headers.get("content-disposition").split("filename=")[1]
-                    print(fn)
+                    cd = r.headers.get("content-disposition")
+                    fn = re.findall('filename="?(.+)"?', cd)
+                    fn = fn[0]
                 else:
-                    print("unknown filename")
+                    fn = resource["id"]
+                fn = pathlib.Path(fn)
+                fn.write_bytes(r.content)
             except:
                 print("ERROR")
                 print(r.status_code)
                 print(r.content)
         print()
         print()
-    
 
-def whispersync(auth):
+
+def download_pdoc(auth: "kindle.Authenticator", asin: str) -> None:
+    "Downloading personal added documents"
+    url = "https://cde-ta-g7g.amazon.com/FionaCDEServiceEngine/FSDownloadContent"
+    params = {
+        "type": "PDOC",
+        "key": asin,
+        "is_archived_items": 1,
+        "software_rev": 1184370688
+    }
+    with httpx.Client(auth=auth) as session:
+        r = session.get(url, params=params)
+        pathlib.Path(asin).write_bytes(r.content)
+
+
+def whispersync(auth: "kindle.Authenticator") -> Dict:
     user_id = auth.customer_info["user_id"]
     url = f"https://api.amazon.com/whispersync/v2/data/{user_id}/datasets"
     params1 = {
@@ -146,7 +196,8 @@ def whispersync(auth):
         return r.json()
 
 
-def whispersync_records_by_identifier(auth, identifier: str):
+def whispersync_records_by_identifier(auth: "kindle.Authenticator",
+                                      identifier: str) -> Dict:
     user_id = auth.customer_info["user_id"]
     url = f"https://api.amazon.com/whispersync/v2/data/{user_id}/datasets/{identifier}/records"
     params = {
@@ -157,21 +208,32 @@ def whispersync_records_by_identifier(auth, identifier: str):
         return r.json()
 
 
-def sidecar(auth, asin: str):
+def sidecar_ebook(auth: "kindle.Authenticator", asin: str) -> Dict:
     url = f"https://sars.amazon.com/sidecar/sa/EBOK/{asin}"
     with httpx.Client(auth=auth) as session:
         r = session.get(url)
         return r.json()
 
 
-def get_news(auth):
+def sidecar_pdoc(auth: "kindle.Authenticator", asin: str) -> Dict:
+    url = f"https://cde-ta-g7g.amazon.com/FionaCDEServiceEngine/sidecar"
+    params = {
+        "type": "PDOC",
+        "key": asin
+    }
+    with httpx.Client(auth=auth, params=params) as session:
+        r = session.get(url)
+        return r.json()
+
+
+def get_news(auth: "kindle.Authenticator") -> Dict:
     url = "https://sars.amazon.com/kinapps/notifications/new"
     with httpx.Client(auth=auth) as session:
         r = session.get(url)
         return r.json()
 
 
-def get_notification_channels(auth, marketplace: str):
+def get_notification_channels(auth: "kindle.Authenticator", marketplace: str) -> Dict:
     # marketplace e.g. A1PA6795UKMFR9
     url = f"https://d3ohh9b4v3oawh.cloudfront.net/iOS/1.1/{marketplace}/notificationsChannels.json"
     with httpx.Client(auth=auth) as session:
@@ -179,7 +241,7 @@ def get_notification_channels(auth, marketplace: str):
         return r.json()
 
 
-def get_device_credentials(auth):
+def get_device_credentials(auth: "kindle.Authenticator") -> Dict:
     # gives same credential types like a device registration
     # value are different, but why?
     # credentials from device registration are still valid
