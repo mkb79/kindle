@@ -114,7 +114,7 @@ def download_ebook(auth: "kindle.Authenticator", manifest: Dict, make_zip=True):
         print(f"ID:          {id_}")
         print(f"SIZE:        {size}")
 
-        url = endpoint.get("directUrl", endpoint.get("url"))
+        url = endpoint.get("directUrl") or endpoint.get("url")
         assert url is not None, "Error getting url for part."
 
         headers = {}
@@ -159,8 +159,14 @@ def download_ebook(auth: "kindle.Authenticator", manifest: Dict, make_zip=True):
         print()
         print()
 
+    asin = manifest["content"]["id"].upper()
+    manifest_file = pathlib.Path(f"{asin}.manifest")
+    manifest_json_data = json.dumps(manifest)
+    manifest_file.write_text(manifest_json_data)
+    files.append(manifest_file)
+
     if make_zip:
-        fn = manifest["content"]["id"].upper() + "_EBOK.kfx-zip"
+        fn = asin + "_EBOK.kfx-zip"
         with ZipFile(fn, 'w') as myzip:
             for file in files:
                 myzip.write(file)
