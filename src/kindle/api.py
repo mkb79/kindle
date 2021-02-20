@@ -5,13 +5,17 @@ import base64
 import json
 import pathlib
 import re
+from collections import namedtuple
 from datetime import datetime
+from enum import Enum
 from typing import Dict, Optional, Union
 from zipfile import ZipFile
 
 import httpx
 import xmltodict
 from amazon.ion import simpleion
+
+from .dedrm import KFXZipBook
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -95,33 +99,60 @@ def get_manifest_ebook(auth: "kindle.Authenticator", asin: str) -> Dict:
     return manifest
 
 
-def download_ebook(auth: "kindle.Authenticator", manifest: Dict, make_zip=True):
-    """proof-of-concent, quick and dirty, donwload content and saving them in current working dir."""
-    session = httpx.Client(auth=auth)
-    files = []
+class Scope(Enum):
+    REQUIRED = 1
+    PREFERRED = 2
+    DEFERRED = 3
+
+    def should_download(self, s: str):
+        r = Scope[s.upper()]
+        return self.value >= r.value
+
+
+Request = namedtuple("Request", ["method", "url", "fn", "headers"])
+
+
+def download_ebook(auth: "kindle.Authenticator",
+                   manifest: Dict,
+                   scope: Union[str, Scope] = Scope.DEFERRED,
+                   decrypt: bool = False):
+    """proof-of-concent, quick and dirty.
+    
+    Download content and create a kfx-zip file in the current working dir. 
+    Decrypts the book optionally.
+    """
+    assert "resources" in manifest, "Incorrect manifest data"
+    if isinstance(scope, str):
+        try:
+            scope = Scope[scope.upper()]
+        except KeyError:
+            allowed_scopes = [s.name.lower() for s in Scope]
+            raise ValueError(
+                "Scope must be in %s, got %s" % \
+                (", ".join(allowed_scopes), scope)
+            )    
+
+    session = httpx.Client(auth=auth, timeout=None)
+    parts = []
     for resource in manifest["resources"]:
-        delivery = resource.get("deliveryType")
-        requirement = resource.get("requirement")
-        type_ = resource.get("type")
-        size = resource.get("size")
-        endpoint = resource.get("optimalEndpoint", resource.get("endpoint"))
-        id_ = resource["id"]
+        if not scope.should_download(resource["requirement"]):
+            continue
 
-        print(f"TYPE:        {type_}")
-        print(f"DELIVERY:    {delivery}")
-        print(f"ENDPOINT:    {endpoint}")
-        print(f"REQUIREMENT: {requirement}")
-        print(f"ID:          {id_}")
-        print(f"SIZE:        {size}")
-
-        url = endpoint.get("directUrl") or endpoint.get("url")
-        assert url is not None, "Error getting url for part."
-
+        try:
+            url = resource.get("optimalEndpoint", {}).get("directUrl") or \
+                resource.get("endpoint")["url"]
+        except KeyError:
+            raise RuntimeError("No url found for item with id %s." % resource["id"])
         headers = {}
-        if type_ == "DRM_VOUCHER":
-            timestamp = manifest["responseContext"]["manifestTime"]
-            asin = manifest["content"]["id"]
-            correlation_id = _build_correlation_id(auth, asin, timestamp)
+        fn = None
+
+        if resource["type"] == "DRM_VOUCHER":
+            fn = resource["id"] + ".voucher"
+            correlation_id = _build_correlation_id(
+                auth=auth,
+                asin=manifest["content"]["id"],
+                timestamp=manifest["responseContext"]["manifestTime"])
+
             headers = {
                 "User-Agent": "Kindle/1.0.235280.0.10 CFNetwork/1220.1 Darwin/20.3.0",
                 "X-ADP-AttemptCount": "1",
@@ -138,27 +169,40 @@ def download_ebook(auth: "kindle.Authenticator", manifest: Dict, make_zip=True):
                 headers["X-ADP-Country"] = manifest["responseContext"]["country"]
             #url += "&supportedVoucherVersions=V1%2CV2%2CV3%2CV4%2CV5%2CV6%2CV7%2CV8%2CV9%2CV10%2CV11%2CV12%2CV13%2CV14%2CV15%2CV16%2CV17%2CV18%2CV19%2CV20%2CV21%2CV22%2CV23%2CV24%2CV25%2CV26%2CV27%2CV28%2CV9708%2CV1031%2CV2069%2CV9041%2CV3646%2CV6052%2CV9479%2CV9888%2CV4648%2CV5683"
             url += "&supportedVoucherVersions=V1"
+        elif resource["type"] == "KINDLE_MAIN_BASE":
+            fn = manifest["content"]["id"] + "_EBOK.azw"
+        elif resource["type"] == "KINDLE_MAIN_METADATA":
+            fn = resource["id"] + ".azw.md"
+        elif resource["type"] == "KINDLE_MAIN_ATTACHABLE":
+            fn = resource["id"] + ".azw.res"
+        elif resource["type"] == "KINDLE_USER_ANOT":
+            fn = manifest["content"]["id"] + "_EBOK.mbpV2"
 
-        try:
-            r = session.get(url, headers=headers)
-            r.raise_for_status()
-        except:
-            print(f"Got error code {r.status_code}. Abort downloading book part.")
-            continue
+        parts.append(
+            Request(
+                method="GET",
+                url=url,
+                fn=fn,
+                headers=headers))
 
-        if r.headers.get("content-disposition"):
+    files = []
+    for part in parts:
+        r = session.request(
+            method=part.method,
+            url=part.url,
+            headers=part.headers)
+        r.raise_for_status()
+        fn = part.fn
+
+        if fn is None:
             cd = r.headers.get("content-disposition")
             fn = re.findall('filename="(.+)"', cd)
             fn = fn[0]
-        else:
-            fn = id_
+
         fn = pathlib.Path(fn)
         files.append(fn)
         fn.write_bytes(r.content)
-        print(f"Book part successfully downloaded and saved to {fn}.")
-
-        print()
-        print()
+        print(f"Book part successfully saved to {fn}")
 
     asin = manifest["content"]["id"].upper()
     manifest_file = pathlib.Path(f"{asin}.manifest")
@@ -166,12 +210,19 @@ def download_ebook(auth: "kindle.Authenticator", manifest: Dict, make_zip=True):
     manifest_file.write_text(manifest_json_data)
     files.append(manifest_file)
 
-    if make_zip:
-        fn = asin + "_EBOK.kfx-zip"
-        with ZipFile(fn, 'w') as myzip:
-            for file in files:
-                myzip.write(file)
-                file.unlink()
+    fn = asin + "_EBOK.kfx-zip"
+    with ZipFile(fn, 'w') as myzip:
+        for file in files:
+            myzip.write(file)
+            file.unlink()
+
+    if decrypt:
+        fn_dec = asin + "_EBOK.kfx-zip.tmp"
+        kfx_book = KFXZipBook(fn, auth)
+        kfx_book.processBook()
+        kfx_book.getFile(fn_dec)
+        pathlib.Path(fn).unlink()
+        pathlib.Path(fn_dec).rename(fn)
 
 
 def download_pdoc(auth: "kindle.Authenticator", asin: str) -> None:
