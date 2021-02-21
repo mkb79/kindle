@@ -2,9 +2,6 @@
 This code is copied from https://github.com/apprenticeharper/DeDRM_tools and
 recode to use amazon.ion instead of the DeDRM BinaryIonParser class. Added
 support for converting a metadata file from DRMION format.
-
-This script will need pycrypto or pycryptodome at this moment. But I will 
-switch to kindle.aescipher.aes_cbc_decrypt as soon as possible.
 """
 
 import hashlib
@@ -17,8 +14,8 @@ from io import BytesIO
 from amazon.ion import simpleion
 from amazon.ion.symbols import shared_symbol_table, SymbolTableCatalog
 from amazon.ion.core import IonType
-from Crypto.Cipher import AES
-from Crypto.Util.py3compat import bchr
+
+from .aescipher import aes_cbc_decrypt
 
 pythonista_lzma = False
 try:
@@ -69,24 +66,11 @@ def _assert(test, msg="Exception"):
         raise Exception(msg)
 
 
-def pkcs7unpad(msg, blocklen):
-    _assert(len(msg) % blocklen == 0)
-
-    paddinglen = msg[-1]
-
-    _assert(paddinglen > 0 and paddinglen <= blocklen, "Incorrect padding - Wrong key")
-    _assert(msg[-paddinglen:] == bchr(paddinglen) * paddinglen, "Incorrect padding - Wrong key")
-
-    return msg[:-paddinglen]
-
-
 def IonParser(ion: bytes, single_value: bool = True, addprottable: bool = False):
+    catalog = SymbolTableCatalog()
     if addprottable:
         table = shared_symbol_table('ProtectedData', 1, SYM_NAMES)
-        catalog = SymbolTableCatalog()
         catalog.register(table)
-    else:
-        catalog = SymbolTableCatalog()
 
     return simpleion.loads(ion, catalog=catalog, single_value=single_value)
 
@@ -130,9 +114,8 @@ class DrmIonVoucher:
         sharedsecret = shared.encode("ASCII")
 
         key = hmac.new(sharedsecret, b"PIDv3", digestmod=hashlib.sha256).digest()
-        aes = AES.new(key[:32], AES.MODE_CBC, self.cipheriv[:16])
-        b = aes.decrypt(self.ciphertext)
-        b = pkcs7unpad(b, 16)
+
+        b = aes_cbc_decrypt(key[:32], self.cipheriv[:16], self.ciphertext)
 
         self.drmkey = IonParser(b, addprottable=True)
         _assert(len(self.drmkey) > 0 and
@@ -265,8 +248,7 @@ class DrmIon:
 
     def processpage(self, ct, civ, outpages, decompress):
         if civ is not None:
-            aes = AES.new(self.key[:16], AES.MODE_CBC, civ[:16])
-            msg = pkcs7unpad(aes.decrypt(ct), 16)
+            msg = aes_cbc_decrypt(self.key[:16], civ[:16], ct)
         else:
             msg = ct
 

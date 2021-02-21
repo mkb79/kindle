@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import pathlib
-import re
 import struct
 from hashlib import sha256
 from typing import Dict, Optional, Tuple, TYPE_CHECKING, Union
@@ -41,7 +40,7 @@ def aes_cbc_encrypt(key: bytes, iv: bytes, data: str,
 def aes_cbc_decrypt(key: bytes,
                     iv: bytes,
                     encrypted_data: bytes,
-                    padding: str = "default") -> str:
+                    padding: str = "default") -> bytes:
     """Decrypts data encrypted in cipher block chaining mode of operation.
 
     Args:
@@ -55,7 +54,7 @@ def aes_cbc_decrypt(key: bytes,
     """
     decrypter = Decrypter(AESModeOfOperationCBC(key, iv), padding=padding)
     decrypted = decrypter.feed(encrypted_data) + decrypter.feed()
-    return decrypted.decode("utf-8")
+    return decrypted
 
 
 def create_salt(salt_marker: bytes,
@@ -205,7 +204,7 @@ class AESCipher:
             kdf_iterations=kdf_iterations,
             hashmod=self.hashmod,
             mac=self.mac)
-        return aes_cbc_decrypt(key, iv, encrypted_data)
+        return aes_cbc_decrypt(key, iv, encrypted_data).decode("utf-8")
 
     def to_dict(self, data: str) -> Dict[str, str]:
         """Encrypts data in dict style.
