@@ -10,6 +10,7 @@ import os
 import shutil
 import zipfile
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 from amazon.ion import simpleion
 from amazon.ion.symbols import shared_symbol_table, SymbolTableCatalog
@@ -23,12 +24,11 @@ try:
 except ImportError:
     try:
         import pylzma as lzma
-    except:
+    except ImportError:
         # need this to use lzma for Pythonista (iOS)
         pythonista_lzma = True
         import plzma as lzma
 
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import kindle
 
@@ -66,7 +66,8 @@ def _assert(test, msg="Exception"):
         raise Exception(msg)
 
 
-def IonParser(ion: bytes, single_value: bool = True, addprottable: bool = False):
+def get_ion_parser(ion: bytes, single_value: bool = True,
+                   addprottable: bool = False):
     catalog = SymbolTableCatalog()
     if addprottable:
         table = shared_symbol_table('ProtectedData', 1, SYM_NAMES)
@@ -94,13 +95,12 @@ class DrmIonVoucher:
 
     def __init__(self, voucherenv, dsn, secret):
         self.dsn, self.secret = dsn, secret
-
         self.lockparams = []
+        self.envelope = get_ion_parser(voucherenv, addprottable=True)
 
-        self.envelope = IonParser(voucherenv, addprottable=True)
-
-    def decryptvoucher(self):
-        shared = "PIDv3" + self.encalgorithm + self.enctransformation + self.hashalgorithm
+    def decrypt_voucher(self):
+        shared = "PIDv3" + self.encalgorithm + self.enctransformation \
+                 + self.hashalgorithm
 
         self.lockparams.sort()
         for param in self.lockparams:
@@ -112,12 +112,10 @@ class DrmIonVoucher:
                 _assert(False, "Unknown lock parameter: %s" % param)
 
         sharedsecret = shared.encode("ASCII")
-
         key = hmac.new(sharedsecret, b"PIDv3", digestmod=hashlib.sha256).digest()
-
         b = aes_cbc_decrypt(key[:32], self.cipheriv[:16], self.ciphertext)
 
-        self.drmkey = IonParser(b, addprottable=True)
+        self.drmkey = get_ion_parser(b, addprottable=True)
         _assert(len(self.drmkey) > 0 and
                 self.drmkey.ion_type == IonType.LIST and
                 self.drmkey.ion_annotations[0].text == "com.amazon.drm.KeySet@1.0",
@@ -136,7 +134,6 @@ class DrmIonVoucher:
 
     def parse(self):
         _assert(len(self.envelope) > 0, "Envelope is empty")
-        self.envelope.ion_annotations[0].text
         _assert(
             self.envelope.ion_type == IonType.STRUCT and 
             self.envelope.ion_annotations[0].text.startswith(
@@ -145,8 +142,7 @@ class DrmIonVoucher:
             "Unknown type encountered in envelope, expected VoucherEnvelope"
         )
         self.version = int(self.envelope.ion_annotations[0].text.split('@')[1][:-2])
-
-        self.voucher = IonParser(self.envelope["voucher"], addprottable=True)
+        self.voucher = get_ion_parser(self.envelope["voucher"], addprottable=True)
 
         strategy_annotation_name = self.envelope["strategy"].ion_annotations[0].text
         _assert(strategy_annotation_name == "com.amazon.drm.PIDv3@1.0",
@@ -161,9 +157,9 @@ class DrmIonVoucher:
                 "Expected string list for lock_parameters")
         self.lockparams.extend(lockparams)
         
-        self.parsevoucher()
+        self.parse_voucher()
 
-    def parsevoucher(self):
+    def parse_voucher(self):
         _assert(len(self.voucher) > 0, "Voucher is empty")
         _assert(self.voucher.ion_type == IonType.STRUCT and 
                 self.voucher.ion_annotations[0].text == "com.amazon.drm.Voucher@1.0",
@@ -176,7 +172,7 @@ class DrmIonVoucher:
                 "Unknown license: %s" % self.voucher["license"].ion_annotations[0].text)
         self.license_type = self.voucher["license"]["license_type"]
 
-    def getlicensetype(self):
+    def get_license_type(self):
         return self.license_type
 
 
@@ -188,17 +184,14 @@ class DrmIon:
     onvoucherrequired = None
 
     def __init__(self, ionstream, onvoucherrequired):
-        self.ion = IonParser(ionstream, addprottable=True, single_value=False)
-        self.onvoucherrequired = onvoucherrequired
+        self.ion = get_ion_parser(ionstream, addprottable=True, single_value=False)
+        self.onvoucherrequired = onvoucherrequired        
 
-    def _prepare_parse(self):
+    def parse(self, outpages):
         _assert(len(self.ion) > 0, "DRMION envelope is empty")
         _assert(self.ion[0].ion_type == IonType.SYMBOL and self.ion[0].ion_annotations[0].text == "doctype", "Expected doctype symbol")
         _assert(self.ion[1].ion_type == IonType.LIST and self.ion[1].ion_annotations[0].text in ["com.amazon.drm.Envelope@1.0", "com.amazon.drm.Envelope@2.0"],
                 "Unknown type encountered in DRMION envelope, expected Envelope, got %s" % self.ion[1].ion_annotations[0].text)
-
-    def parse(self, outpages):
-        self._prepare_parse()
 
         for ion_list in self.ion:
             if not ion_list.ion_annotations[0].text in ["com.amazon.drm.Envelope@1.0", "com.amazon.drm.Envelope@2.0"]:
@@ -220,34 +213,23 @@ class DrmIon:
 
                 elif item.ion_annotations[0].text in ["com.amazon.drm.EncryptedPage@1.0", "com.amazon.drm.EncryptedPage@2.0"]:
                     decompress = False
-                    ct = None
-                    civ = None
+                    decrypt = True
                     if item["cipher_text"].ion_annotations[0].text == "com.amazon.drm.Compressed@1.0":
                         decompress = True
                     ct = item["cipher_text"]
                     civ = item["cipher_iv"]
                     if ct is not None and civ is not None:
-                        self.processpage(ct, civ, outpages, decompress)
-
-    def parse_metadata(self, outpages):
-        self._prepare_parse()
-
-        for ion_list in self.ion:
-            if not ion_list.ion_annotations[0].text in ["com.amazon.drm.Envelope@1.0", "com.amazon.drm.Envelope@2.0"]:
-                continue
-
-            for item in ion_list:
-                if item.ion_annotations[0].text in ["com.amazon.drm.EnvelopeMetadata@1.0", "com.amazon.drm.EnvelopeMetadata@2.0"]:
-                        continue
+                        self.processpage(ct, civ, outpages, decompress, decrypt)
 
                 elif item.ion_annotations[0].text in ["com.amazon.drm.PlainText@1.0", "com.amazon.drm.PlainText@2.0"]:
                     decompress = False
+                    decrypt = False
                     if item["data"].ion_annotations[0].text == "com.amazon.drm.Compressed@1.0":
                         decompress = True
-                    self.processpage(item["data"], None, outpages, decompress)
+                    self.processpage(item["data"], None, outpages, decompress, decrypt)
 
-    def processpage(self, ct, civ, outpages, decompress):
-        if civ is not None:
+    def processpage(self, ct, civ, outpages, decompress, decrypt):
+        if decrypt:
             msg = aes_cbc_decrypt(self.key[:16], civ[:16], ct)
         else:
             msg = ct
@@ -267,7 +249,7 @@ class DrmIon:
         decomp = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
         while not decomp.eof:
             segment = decomp.decompress(msg[1:])
-            msg = b"" # Contents were internally buffered after the first call
+            msg = b""  # Contents were internally buffered after the first call
             outpages.write(segment)
 
 
@@ -294,9 +276,6 @@ class KFXZipBook:
                     print("Decrypting KFX DRMION: {0}".format(filename))
                     outfile = BytesIO()
                     DrmIon(data[8:-8], lambda name: self.voucher).parse(outfile)
-                    if len(outfile.getvalue()) == 0:
-                        DrmIon(data[8:-8], lambda name: self.voucher).parse_metadata(
-                            outfile)
                     outfile = outfile.getvalue()
                     if len(outfile) > 0:
                         self.decrypted[filename] = outfile
@@ -332,7 +311,7 @@ class KFXZipBook:
             try:
                 voucher = DrmIonVoucher(data, pid[:dsn_len], pid[dsn_len:])
                 voucher.parse()
-                voucher.decryptvoucher()
+                voucher.decrypt_voucher()
                 break
             except:
                 pass
@@ -341,7 +320,7 @@ class KFXZipBook:
 
         print("KFX DRM voucher successfully decrypted")
 
-        license_type = voucher.getlicensetype()
+        license_type = voucher.get_license_type()
         if license_type != "Purchase":
             raise Exception(("This book is licensed as {0}. "
                     'These tools are intended for use on purchased books.').format(license_type))
