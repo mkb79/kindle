@@ -555,7 +555,8 @@ class Authenticator(httpx.Auth):
         login_device = external_login(
             country_code=self.locale.country_code,
             domain=self.locale.domain,
-            market_place_id=self.locale.market_place_id,
+            serial=serial,
+            
             login_url_callback=login_url_callback)
 
         serial = login_device.pop("serial")
